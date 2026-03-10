@@ -605,7 +605,7 @@ That means:
 - `gmean_score_acceptor`
 - `gmean_score_donor`
 
-will not necessarily sum to 1 at a base, which is expected behaviour.
+will not necessarily sum to 1 at a base, and is expected behaviour.
 
 ### Why include geometric mean at all?
 
