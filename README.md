@@ -635,7 +635,7 @@ $$
 C = \frac{2}{3}(p_1 - p_2) + \frac{1}{3}\left(1 - \frac{H(p)}{\log 3}\right)
 $$
 
-where \(p_1\) and \(p_2\) are the top two normalized class probabilities and \(H(p)\) is entropy.
+where $p_1$ and $p_2$ are the top two normalized class probabilities and $H(p)$ is entropy.
 
 ### What it is for
 
