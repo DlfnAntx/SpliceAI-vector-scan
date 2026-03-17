@@ -75,7 +75,7 @@ def _get_logger():
 
 logger, _HAS_LOGURU = _get_logger()
 
-__version__ = "1.6.2"
+__version__ = "1.7.1"
 
 
 def _normalize_log_level(level: Optional[str]) -> _Tuple[str, Optional[str]]:
@@ -251,12 +251,14 @@ def _ensure_tf_keras() -> None:
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments and enforce required inputs."""
     p = argparse.ArgumentParser(
-        description="Scan cassette (pre-mRNA) sequences with SpliceAI (input order + reversed input order) and export per-base probabilities + bins."
+        description="Scan cassette (pre-mRNA) sequences with SpliceAI (sense + optional reverse/complement/revcomp scans) and export per-base probabilities + bins."
     )
     p.add_argument(
         "-i", "--in-file",
-        dest="in_file",
-        help="Input file containing nucleotide sequences "
+        dest="in_files",
+        nargs="+",
+        action="append",
+        help="One or more input files containing nucleotide sequences "
              "(FASTA/FASTQ/GenBank/EMBL/SAM/BAM/CRAM/VCF/BCF or plain text). "
              "Note: SAM/BAM/CRAM provide query/read sequences; VCF/BCF provide literal allele strings; "
              "this tool does not reconstruct reference windows from coordinates. "
@@ -288,7 +290,9 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing spliceai1.h5..spliceai5.h5. If omitted, will default to SpliceAI's package resources."
     )
     p.add_argument("--cpu", action="store_true", help="Force CPU even if a GPU is available (GPU visibility disabled).")
-    p.add_argument("--no-reverse", dest="no_reverse", action="store_true", help="Disable reversed-sequence scoring (reverse order, not reverse-complement).")
+    p.add_argument("--reverse", "--rev", dest="scan_reverse", action="store_true", help="Enable reverse-order scanning (not reverse-complement). Off by default.")
+    p.add_argument("--complement", "--comp", dest="scan_complement", action="store_true", help="Enable complement scanning (same order, complemented bases). Off by default.")
+    p.add_argument("--revcomp", "--rc", "--reverse-complement", dest="scan_revcomp", action="store_true", help="Enable reverse-complement scanning. Off by default.")
     p.add_argument(
         "--predict-mode",
         choices=["call", "on_batch"],
@@ -308,7 +312,7 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
 
     if not args.version:
-        if args.in_file is None or args.out_prefix is None:
+        if not args.in_files or args.out_prefix is None:
             p.error("-i/--in-file and -o/--out-prefix are required unless --version is specified.")
 
     return args
@@ -320,10 +324,10 @@ def version_banner() -> None:
     banner = (
         f"spliceai_vector_scan.py v{__version__}\n"
         " - SpliceAI ensemble: 10k-context (5 models) wrapped into one cached .keras ensemble wrapper\n"
-        " - Extracts nucleotide sequence(s) from many file types (FASTA/FASTQ/GenBank/EMBL/SAM/BAM/CRAM/VCF/BCF or plain text)\n"
+        " - Extracts nucleotide sequence(s) from one or more input files (FASTA/FASTQ/GenBank/EMBL/SAM/BAM/CRAM/VCF/BCF or plain text)\n"
         " - Device: auto GPU/CPU (override with --cpu)\n"
         " - Full-length per-sequence inference\n"
-        " - Per-base probabilities + bins; reversed input-order optional (not reverse complement)\n"
+        " - Per-base probabilities + bins; optional reverse/complement/revcomp scans (disabled by default)\n"
         f" - Python: {_platform.python_version()}\n"
     )
     print(banner)
@@ -524,9 +528,105 @@ def _guess_biopy_format_from_ext(path: str) -> Optional[str]:
     return None
 
 
-def read_sequences(path_or_file: Union[str, IO]) -> Iterable[Tuple[str, str]]:
+_STRAND_TAG_RE = re.compile(r"(?:^|[\s;|])strand[=:]([+-]|[+-]?1)(?:$|[\s;|])", re.IGNORECASE)
+_UCSC_COORD_STRAND_RE = re.compile(r":[0-9]+-[0-9]+:([+-]|[+-]?1)(?:$|[\s;|])")
+_ENSEMBL_COORD_STRAND_RE = re.compile(r":[0-9]+:[0-9]+:([+-]?1)(?:$|[\s;|])")
+_STRAND_TEXT_PATTERNS = (_STRAND_TAG_RE, _UCSC_COORD_STRAND_RE, _ENSEMBL_COORD_STRAND_RE)
+
+
+def _normalize_strand_value(value: object) -> Optional[str]:
+    """Normalize a strand token to '+'/'-' when possible. Input: token; output: '+'/'-' or None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, np.integer)):
+        if int(value) == 1:
+            return "+"
+        if int(value) == -1:
+            return "-"
+    s = str(value).strip()
+    if not s:
+        return None
+    if s in {"+", "+1", "1"}:
+        return "+"
+    if s in {"-", "-1"}:
+        return "-"
+    return None
+
+
+def _infer_strand_from_text(text: str) -> Optional[str]:
+    """Infer strand from identifier/description text using standard tags or coordinate suffixes."""
+    if not text:
+        return None
+    for pat in _STRAND_TEXT_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return _normalize_strand_value(m.group(1))
+    return None
+
+
+def _strand_from_full_length_feature(feature, length: int) -> Optional[str]:
+    """Return strand if a feature spans the full sequence length. Input: feature and length; output: '+'/'-' or None."""
+    loc = getattr(feature, "location", None)
+    if loc is None:
+        return None
+    try:
+        start = int(loc.start)
+        end = int(loc.end)
+    except Exception:
+        return None
+    if start != 0 or end != length:
+        return None
+    return _normalize_strand_value(getattr(loc, "strand", None))
+
+
+def _strand_from_features(rec) -> Optional[str]:
+    """Extract strand from full-length SeqRecord features (source or full-span)."""
+    feats = getattr(rec, "features", None) or []
+    if not feats:
+        return None
+    try:
+        length = len(rec.seq)
+    except Exception:
+        return None
+
+    for feat in feats:
+        if getattr(feat, "type", None) != "source":
+            continue
+        strand = _strand_from_full_length_feature(feat, length)
+        if strand:
+            return strand
+
+    for feat in feats:
+        strand = _strand_from_full_length_feature(feat, length)
+        if strand:
+            return strand
+
+    return None
+
+
+def _infer_strand_from_seqrecord(rec) -> Optional[str]:
+    """Infer strand from SeqRecord annotations, features, or header text."""
+    ann = getattr(rec, "annotations", None) or {}
+    for key in ("strand", "orientation", "direction"):
+        strand = _normalize_strand_value(ann.get(key))
+        if strand:
+            return strand
+
+    strand = _strand_from_features(rec)
+    if strand:
+        return strand
+
+    for text in (getattr(rec, "description", None), getattr(rec, "id", None), getattr(rec, "name", None)):
+        strand = _infer_strand_from_text(text or "")
+        if strand:
+            return strand
+
+    return None
+
+
+def read_sequences(path_or_file: Union[str, IO]) -> Iterable[Tuple[str, str, str]]:
     """
-    Yield (label, SEQUENCE_UPPERCASED) from multiple formats.
+    Yield (label, SEQUENCE_UPPERCASED, strand) from multiple formats.
 
     Supports FASTA/FASTQ/GenBank/EMBL (Biopython), SAM/BAM/CRAM and VCF/BCF (pysam),
     or plain text as a fallback.
@@ -572,7 +672,10 @@ def read_sequences(path_or_file: Union[str, IO]) -> Iterable[Tuple[str, str]]:
                             label = qname
                     except Exception:
                         label = qname
-                    yield (label, seq.upper())
+                    is_rev = bool(getattr(aln, "is_reverse", False))
+                    is_unmapped = bool(getattr(aln, "is_unmapped", False))
+                    strand = "-" if (is_rev and not is_unmapped) else "+"
+                    yield (label, seq.upper(), strand)
                     n += 1
             finally:
                 af.close()
@@ -601,7 +704,7 @@ def read_sequences(path_or_file: Union[str, IO]) -> Iterable[Tuple[str, str]]:
                     ref = (rec.ref or "").upper()
                     if ref:
                         label_ref = f"{chrom}:{pos}:{rid}:REF" if rid else f"{chrom}:{pos}:REF"
-                        yield (label_ref, ref)
+                        yield (label_ref, ref, "+")
                         n_ref += 1
 
                     for i, alt in enumerate(rec.alts or []):
@@ -610,7 +713,7 @@ def read_sequences(path_or_file: Union[str, IO]) -> Iterable[Tuple[str, str]]:
                             n_symbolic += 1
                             continue
                         label_alt = f"{chrom}:{pos}:{rid}:ALT{i+1}" if rid else f"{chrom}:{pos}:ALT{i+1}"
-                        yield (label_alt, a)
+                        yield (label_alt, a, "+")
                         n_alt += 1
 
             finally:
@@ -667,7 +770,8 @@ def read_sequences(path_or_file: Union[str, IO]) -> Iterable[Tuple[str, str]]:
                     if not seq:
                         continue
                     label = str(rec.id) if getattr(rec, "id", None) else (str(rec.name) if getattr(rec, "name", None) else "record")
-                    yield (label, seq)
+                    strand = _infer_strand_from_seqrecord(rec) or "+"
+                    yield (label, seq, strand)
                     got_one = True
                 if got_one:
                     logger.info(f"Detected {fmt.upper()} and parsed sequence records")
@@ -719,7 +823,7 @@ def read_sequences(path_or_file: Union[str, IO]) -> Iterable[Tuple[str, str]]:
                 if block:
                     seq = _clean_line("".join(block))
                     if seq:
-                        yield (f"seq{i}", seq)
+                        yield (f"seq{i}", seq, "+")
                         i += 1
                     block = []
                 continue
@@ -729,7 +833,7 @@ def read_sequences(path_or_file: Union[str, IO]) -> Iterable[Tuple[str, str]]:
         if block:
             seq = _clean_line("".join(block))
             if seq:
-                yield (f"seq{i}", seq)
+                yield (f"seq{i}", seq, "+")
     else:
         logger.info("Parsing plain text: one sequence per non-empty, non-header line")
         i = 1
@@ -739,7 +843,7 @@ def read_sequences(path_or_file: Union[str, IO]) -> Iterable[Tuple[str, str]]:
                 continue
             seq = _clean_line(s)
             if seq:
-                yield (f"seq{i}", seq)
+                yield (f"seq{i}", seq, "+")
                 i += 1
 #### End Section: Input handling ####
 
@@ -748,6 +852,24 @@ def rev(seq: str) -> str:
     """Return the sequence in reverse order (NOT reverse-complement)."""
     return seq[::-1]
 
+_COMPLEMENT_TABLE = str.maketrans({
+    "A": "T", "C": "G", "G": "C", "T": "A", "U": "A",
+    "R": "Y", "Y": "R", "S": "S", "W": "W", "K": "M", "M": "K",
+    "B": "V", "D": "H", "H": "D", "V": "B", "N": "N",
+    "a": "T", "c": "G", "g": "C", "t": "A", "u": "A",
+    "r": "Y", "y": "R", "s": "S", "w": "W", "k": "M", "m": "K",
+    "b": "V", "d": "H", "h": "D", "v": "B", "n": "N",
+})
+
+
+def complement(seq: str) -> str:
+    """Return the complement sequence (IUPAC-aware; output uppercase)."""
+    return seq.translate(_COMPLEMENT_TABLE)
+
+
+def revcomp(seq: str) -> str:
+    """Return the reverse-complement sequence (IUPAC-aware)."""
+    return complement(seq)[::-1]
 
 def _resolve_model_paths(model_dir: Optional[str]) -> List[str]:
     """Resolve paths to spliceai1.h5..spliceai5.h5 from model_dir or package resources."""
@@ -1003,10 +1125,10 @@ def one_hot_encode_with_pad(seq: str, context: int) -> np.ndarray:
     return out
 
 
-def _run_ensemble_one_strand(
+def _run_ensemble_one_scan(
     seq: str,
     header: str,
-    strand: str,
+    scan_label: str,
     ensemble_model,
     context: int,
     predict_mode: str,
@@ -1014,7 +1136,7 @@ def _run_ensemble_one_strand(
     need_gmean: bool,
 ) -> Tuple[Optional[np.ndarray], np.ndarray, Optional[np.ndarray]]:
     """
-    Run ensemble on one sequence/strand.
+    Run ensemble on one sequence scan.
 
     Returns:
       members: [L, N, 3] float32 (or None if need_members=False and need_gmean=False)
@@ -1023,14 +1145,14 @@ def _run_ensemble_one_strand(
     """
     L = len(seq)
     x = one_hot_encode_with_pad(seq, context)  # [1, L+S, 4]
-    logger.debug(f"Forward pass on full-length {strand} sequence; len={L}, context={context}")
+    logger.debug(f"Forward pass on full-length scan={scan_label} sequence; len={L}, context={context}")
 
     try:
         out = ensemble_model.predict_on_batch(x) if predict_mode == "on_batch" else ensemble_model(x, training=False)
     except tf.errors.ResourceExhaustedError:
         logger.error(
             f"OOM while running full-length inference for "
-            f"record={header} strand={strand} (length={L}, context={context}). "
+            f"record={header} scan={scan_label} (length={L}, context={context}). "
             "You may need to shorten your sequences or switch to a device with more memory."
         )
         raise
@@ -1038,7 +1160,7 @@ def _run_ensemble_one_strand(
     if not isinstance(out, (list, tuple)):
         out = [out]
     if not out:
-        raise ValueError(f"Ensemble model returned no outputs for record={header} strand={strand}.")
+        raise ValueError(f"Ensemble model returned no outputs for record={header} scan={scan_label}.")
 
     per_model: List[np.ndarray] = []
     for idx, y in enumerate(out):
@@ -1055,7 +1177,7 @@ def _run_ensemble_one_strand(
         if arr.ndim != 2 or arr.shape[1] != 3 or arr.shape[0] != L:
             raise ValueError(
                 f"Submodel #{idx+1} output has shape {arr.shape}; expected [L, 3] with L={L} "
-                f"for record={header} strand={strand}."
+                f"for record={header} scan={scan_label}."
             )
         per_model.append(arr.astype(np.float32, copy=False))
 
@@ -1187,6 +1309,63 @@ def write_members_csv(
             w.writerow(row)
 
 
+class _MembersCSVWriter:
+    """
+    Stream writer for a per-scan ensemble-members CSV spanning all records.
+    """
+    def __init__(self, out_prefix: str, scan_label: str, gzip_out: bool):
+        """Initialize writer for a scan. Input: output prefix, scan label, gzip flag; output: instance."""
+        self.out_path = f"{out_prefix}.{scan_label}.members.csv" + (".gz" if gzip_out else "")
+        self._opener = gzip.open if gzip_out else open
+        self._fh = None
+        self._writer = None
+        self._n_models = None
+
+    def _ensure_open(self, n_models: int) -> None:
+        """Open the file and write header if needed. Input: number of models; output: None."""
+        if self._fh is None:
+            logger.debug(f"Writing ensemble-members CSV: {self.out_path}")
+            self._fh = self._opener(self.out_path, "wt", newline="", encoding="utf-8")
+            self._writer = csv.writer(self._fh)
+            self._n_models = int(n_models)
+            header = ["record_id", "pos_1based", "strand", "base"]
+            for j in range(self._n_models):
+                header += [f"p_neither_m{j+1}", f"p_acceptor_m{j+1}", f"p_donor_m{j+1}"]
+            self._writer.writerow(header)
+        elif self._n_models != int(n_models):
+            raise ValueError(
+                f"Inconsistent model count for members CSV {self.out_path}: expected {self._n_models}, got {n_models}"
+            )
+
+    def write_record(self, record_id: str, strand: str, bases: str, members: np.ndarray) -> None:
+        """Append rows for one record. Input: record_id, strand, bases, members array; output: None."""
+        if members is None:
+            raise ValueError("Members array is required for members CSV output.")
+        if members.ndim != 3 or members.shape[2] != 3:
+            raise ValueError(f"_MembersCSVWriter.write_record(): expected members with shape [L, N, 3], got {members.shape}")
+
+        L, N, _ = members.shape
+        self._ensure_open(N)
+        w = self._writer
+        if w is None:
+            raise RuntimeError("Members CSV writer is not initialized.")
+
+        for i in range(L):
+            row = [record_id, i + 1, strand, bases[i]]
+            row.extend(f"{members[i, j, k]:.6f}" for j in range(N) for k in range(3))
+            w.writerow(row)
+
+    def close(self) -> None:
+        """Close the underlying file handle if open. Input: none; output: None."""
+        if self._fh:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+            self._writer = None
+
+
 def write_bedgraph(
     out_path: str,
     chrom: str,
@@ -1266,7 +1445,7 @@ def _collect_bed6_bins(
 
 class _BigWigTrackWriters:
     """
-    Lazily-opened bigWig writers (pyBigWig) for mean acceptor/donor tracks.
+    Lazily-opened bigWig writers (pyBigWig) for mean acceptor/donor tracks per scan type.
 
     bigWig is effectively an indexed bedGraph; we write fixedStep per-base values (span=1, step=1),
     which is compact and fast for dense per-base signals.
@@ -1285,12 +1464,12 @@ class _BigWigTrackWriters:
         self._bw[key] = bw
         return bw
 
-    def get(self, strand: str, cls_name: str):
-        """Get (or open) a bigWig writer for a track."""
-        key = f"{strand}:{cls_name}"
+    def get(self, scan_label: str, cls_name: str):
+        """Get (or open) a bigWig writer for a scan track."""
+        key = f"{scan_label}:{cls_name}"
         if key in self._bw:
             return self._bw[key]
-        path = f"{self.out_prefix}.{strand}.{cls_name}.mean.bw"
+        path = f"{self.out_prefix}.{scan_label}.{cls_name}.mean.bw"
         return self._open(key, path)
 
     def add_dense_track(self, bw, chrom: str, values_1d: np.ndarray):
@@ -1315,6 +1494,24 @@ def run() -> None:
     if args.version:
         version_banner()
         sys.exit(0)
+
+    input_paths: List[Union[str, IO]] = []
+    for item in args.in_files or []:
+        if isinstance(item, (list, tuple)):
+            input_paths.extend(item)
+        else:
+            input_paths.append(item)
+
+    if not input_paths:
+        logger.error("No input files provided; use -i/--in-file or --version.")
+        sys.exit(2)
+
+    stdin_count = sum(1 for p in input_paths if p == "-")
+    if stdin_count > 1:
+        logger.error("STDIN ('-') can only be specified once.")
+        sys.exit(2)
+
+    input_labels = ["<stdin>" if p == "-" else str(p) for p in input_paths]
 
     if args.context < 0:
         logger.error("--context must be nonnegative.")
@@ -1343,11 +1540,25 @@ def run() -> None:
     det_applied["TF_CUDNN_DETERMINISTIC"] = os.environ.get("TF_CUDNN_DETERMINISTIC")
     logger.debug(f"TF determinism applied: {det_applied}")
 
+    scan_reverse = bool(args.scan_reverse)
+    scan_complement = bool(args.scan_complement)
+    scan_revcomp = bool(args.scan_revcomp)
+
+    scan_configs = [("sense", lambda s: s, False)]
+    if scan_reverse:
+        scan_configs.append(("reverse", rev, True))
+    if scan_complement:
+        scan_configs.append(("complement", complement, False))
+    if scan_revcomp:
+        scan_configs.append(("revcomp", revcomp, True))
+
+    scan_labels = [cfg[0] for cfg in scan_configs]
+    scan_summary = ", ".join(scan_labels)
+
     logger.info("Starting SpliceAI vector scan")
     logger.info(
-        f"Args: in_file={args.in_file}, out_prefix={args.out_prefix}, out_format={args.out_format}, "
-        f"gzip={args.gzip}, predict_mode={args.predict_mode}, "
-        f"reverse={'off' if args.no_reverse else 'on (reverse order, not revcomp)'}"
+        f"Args: in_files={input_labels}, out_prefix={args.out_prefix}, out_format={args.out_format}, "
+        f"gzip={args.gzip}, predict_mode={args.predict_mode}, scans={scan_summary}"
     )
 
     if args.context != 10000:
@@ -1361,7 +1572,6 @@ def run() -> None:
     device_str, _ = auto_device(force_cpu=args.cpu, gpus=gpus)
     device_label = "CPU" if args.cpu or not gpu_available else "GPU"
     logger.info(f"Device selected: {device_label} ({device_str})")
-    do_reverse = not args.no_reverse
 
     out_formats = set(args.out_format)
     write_csv_flag = "csv" in out_formats
@@ -1376,25 +1586,30 @@ def run() -> None:
 
     ensemble, ensemble_meta = load_or_build_ensemble(args.model_dir)
 
-    logger.info("Reading input sequences…")
-    try:
-        records_raw = [(hdr, seq) for hdr, seq in read_sequences(args.in_file)]
-    except Exception as e:
-        logger.error(str(e))
-        sys.exit(2)
+    logger.info(f"Reading input sequences from {len(input_paths)} input(s)…")
+    records_raw: List[Tuple[str, str, str]] = []
+    for in_path in input_paths:
+        label = "<stdin>" if in_path == "-" else str(in_path)
+        logger.info(f"Reading input: {label}")
+        try:
+            for hdr, seq, strand in read_sequences(in_path):
+                records_raw.append((hdr, seq, strand))
+        except Exception as e:
+            logger.error(f"{label}: {e}")
+            sys.exit(2)
 
     if not records_raw:
-        logger.error(f"No nucleotide sequences found in {args.in_file}.")
+        logger.error(f"No nucleotide sequences found in inputs: {', '.join(input_labels)}.")
         sys.exit(2)
 
-    n_bases_raw = sum(len(s) for _, s in records_raw)
+    n_bases_raw = sum(len(s) for _, s, _ in records_raw)
     logger.info(f"Collected {len(records_raw)} record(s) totaling {n_bases_raw:,} bp")
 
-    # Group records by exact sequence for inference reuse (CSV uses merged headers; bed-based outputs remain per-raw-record).
+    # Group records by exact sequence for inference reuse (strand ignored).
     groups: List[Dict[str, object]] = []
     seq_to_g: Dict[str, int] = {}
     raw_to_group: List[int] = [0] * len(records_raw)
-    for idx, (hdr, seq) in enumerate(records_raw):
+    for idx, (hdr, seq, strand) in enumerate(records_raw):
         g = seq_to_g.get(seq)
         if g is None:
             g = len(groups)
@@ -1415,10 +1630,11 @@ def run() -> None:
     # Precompute filename-safe IDs (for output filenames)
     merged_headers = ["|".join(g["headers"]) for g in groups]
     merged_ids_for_path = make_unique_file_ids(merged_headers)
-    raw_ids_for_path = make_unique_file_ids([hdr for hdr, _ in records_raw])
+    raw_ids_for_path = make_unique_file_ids([hdr for hdr, _, _ in records_raw])
 
     # Precompute BEDv1-compliant chrom names for raw records (for BED/bedGraph/bigWig)
-    raw_bed_chroms = make_unique_bed_chroms([hdr for hdr, _ in records_raw])
+    raw_bed_chroms = make_unique_bed_chroms([hdr for hdr, _, _ in records_raw])
+    raw_strands = [strand for _, _, strand in records_raw]
 
     # Optional run metadata (only factors that can impact predictions).
     if args.metadata != "no":
@@ -1458,7 +1674,12 @@ def run() -> None:
                 "run": {
                     "context": int(args.context),
                     "predict_mode": args.predict_mode,
-                    "reverse": bool(do_reverse),
+                    "scans": {
+                        "sense": True,
+                        "reverse": bool(scan_reverse),
+                        "complement": bool(scan_complement),
+                        "revcomp": bool(scan_revcomp),
+                    },
                     "device": {
                         "selected": device_str,
                         "gpu_available": bool(gpu_available),
@@ -1470,6 +1691,8 @@ def run() -> None:
                 "tf_determinism": det_applied,
                 "models": models_section,
                 "input": {
+                    "input_files": ["<stdin>" if p == "-" else str(p) for p in input_paths],
+                    "n_input_files": int(len(input_paths)),
                     "dedupe_exact_sequences_for_inference": True,
                     "n_records_raw": int(len(records_raw)),
                     "n_records_unique": int(n_unique),
@@ -1479,20 +1702,25 @@ def run() -> None:
         except Exception as e:
             logger.warning(f"Failed to write manifest {manifest_path}: {e}")
 
-    # Prepare BED output (single sorted BED6 with acceptor/donor encoded in name)
+    # Prepare BED output (single sorted BED6 with acceptor/donor + scan labels encoded in name)
     bed_rows: Optional[List[Tuple[str, int, int, str, int, str]]] = None
     bed_out_path: Optional[str] = None
     if write_bed_flag:
         bed_rows = []
         bed_out_path = f"{args.out_prefix}.spliceai_bins.bed" + (".gz" if args.gzip else "")
 
-    # Prepare bigWig writers (single file per track) and per-group data for raw-order emission.
+    # Prepare bigWig writers (single file per scan+track) and per-group data for raw-order emission.
     bw_writers = None
-    bw_group_data: Optional[List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]]] = None
+    bw_group_data: Optional[List[Optional[Dict[str, np.ndarray]]]] = None
     if write_bw_flag:
         chrom_sizes = [(raw_bed_chroms[i], int(len(records_raw[i][1]))) for i in range(len(records_raw))]
         bw_writers = _BigWigTrackWriters(args.out_prefix, chrom_sizes)
         bw_group_data = [None] * n_unique
+
+    # Prepare members CSV writers (single file per scan across all records).
+    members_writers: Optional[Dict[str, _MembersCSVWriter]] = None
+    if write_csv_members_flag:
+        members_writers = {scan_label: _MembersCSVWriter(args.out_prefix, scan_label, args.gzip) for scan_label in scan_labels}
 
     # Inference + streaming emission.
     need_members = bool(write_csv_members_flag)
@@ -1500,7 +1728,7 @@ def run() -> None:
 
     logger.info(
         f"Beginning full-length inference over {n_unique} unique sequence(s); "
-        f"device={device_str}, mode={args.predict_mode}"
+        f"scans={scan_summary}; device={device_str}, mode={args.predict_mode}"
     )
 
     with tf.device(device_str):
@@ -1516,107 +1744,86 @@ def run() -> None:
                 f"Processing sequence {g_idx + 1}/{n_unique}: {display_label} (len={len(seq):,} bp)"
             )
 
-            m_s, avg_s, g_s = _run_ensemble_one_strand(
-                seq=seq,
-                header=merged_header,
-                strand="sense",
-                ensemble_model=ensemble,
-                context=args.context,
-                predict_mode=args.predict_mode,
-                need_members=need_members,
-                need_gmean=need_gmean,
-            )
+            raw_indices: List[int] = g["raw_indices"]
+            group_strands = {raw_strands[i] for i in raw_indices if raw_strands[i]}
+            if len(group_strands) == 1:
+                group_strand = next(iter(group_strands))
+            elif not group_strands:
+                group_strand = "+"
+            else:
+                group_strand = "."
+                logger.warning(f"Mixed input strands for merged record {merged_header}; using '.' for CSV outputs.")
 
-            m_rev = avg_rev = g_rev = None
-            if do_reverse:
-                m_raw, avg_raw, g_raw = _run_ensemble_one_strand(
-                    seq=rev(seq),
+            scan_results: Dict[str, Tuple[Optional[np.ndarray], np.ndarray, Optional[np.ndarray]]] = {}
+            for scan_label, transform, needs_reverse in scan_configs:
+                scan_seq = transform(seq)
+                m_scan, avg_scan, g_scan = _run_ensemble_one_scan(
+                    seq=scan_seq,
                     header=merged_header,
-                    strand="reverse",
+                    scan_label=scan_label,
                     ensemble_model=ensemble,
                     context=args.context,
                     predict_mode=args.predict_mode,
                     need_members=need_members,
                     need_gmean=need_gmean,
                 )
-                avg_rev = avg_raw[::-1, :]
-                if g_raw is not None:
-                    g_rev = g_raw[::-1, :]
-                if m_raw is not None:
-                    m_rev = m_raw[::-1, :, :]
+                if needs_reverse:
+                    avg_scan = avg_scan[::-1, :]
+                    if g_scan is not None:
+                        g_scan = g_scan[::-1, :]
+                    if m_scan is not None:
+                        m_scan = m_scan[::-1, :, :]
+                scan_results[scan_label] = (m_scan, avg_scan, g_scan)
 
             if write_csv_flag:
-                path = f"{args.out_prefix}.{merged_id}.sense.csv" + (".gz" if args.gzip else "")
-                write_csv(
-                    path,
-                    record_id=merged_header,
-                    strand="sense",
-                    probs_mean=avg_s,
-                    probs_gmean=g_s,
-                    bases=seq,
-                    gzip_out=args.gzip,
-                )
-
-                if do_reverse and avg_rev is not None:
-                    path = f"{args.out_prefix}.{merged_id}.reverse.csv" + (".gz" if args.gzip else "")
+                for scan_label, (m_scan, avg_scan, g_scan) in scan_results.items():
+                    path = f"{args.out_prefix}.{merged_id}.{scan_label}.csv" + (".gz" if args.gzip else "")
                     write_csv(
                         path,
                         record_id=merged_header,
-                        strand="reverse",
-                        probs_mean=avg_rev,
-                        probs_gmean=g_rev,
-                        bases=seq,
-                        gzip_out=args.gzip,
-                    )
-
-            if write_csv_members_flag:
-                members_path = f"{args.out_prefix}.{merged_id}.sense.members.csv" + (".gz" if args.gzip else "")
-                write_members_csv(
-                    members_path,
-                    record_id=merged_header,
-                    strand="sense",
-                    members=m_s,
-                    bases=seq,
-                    gzip_out=args.gzip,
-                )
-
-                if do_reverse and m_rev is not None:
-                    members_path = f"{args.out_prefix}.{merged_id}.reverse.members.csv" + (".gz" if args.gzip else "")
-                    write_members_csv(
-                        members_path,
-                        record_id=merged_header,
-                        strand="reverse",
-                        members=m_rev,
+                        strand=group_strand,
+                        probs_mean=avg_scan,
+                        probs_gmean=g_scan,
                         bases=seq,
                         gzip_out=args.gzip,
                     )
 
             # Store per-group outputs for bigWig; emit later in raw input order.
             if write_bw_flag and bw_group_data is not None:
-                bw_group_data[g_idx] = (avg_s, avg_rev)
+                bw_group_data[g_idx] = {scan_label: avg for scan_label, (_, avg, _) in scan_results.items()}
 
-            # bedGraph / BED per *raw* record (duplicate sequences get duplicated tracks/features).
-            raw_indices: List[int] = g["raw_indices"]
+            # bedGraph / BED / members CSV per *raw* record (duplicate sequences get duplicated tracks/features/rows).
             for raw_idx in raw_indices:
+                raw_header, _, raw_strand = records_raw[raw_idx]
                 chrom_bed = raw_bed_chroms[raw_idx]
                 file_id = raw_ids_for_path[raw_idx]
 
-                if write_bg_flag:
-                    for cls_idx, cls_name in enumerate(["neither", "acceptor", "donor"]):
-                        path = f"{args.out_prefix}.{file_id}.sense.{cls_name}.bedgraph" + (".gz" if args.gzip else "")
-                        write_bedgraph(path, chrom=chrom_bed, probs=avg_s, class_index=cls_idx, gzip_out=args.gzip)
+                if write_csv_members_flag and members_writers is not None:
+                    for scan_label, (m_scan, _, _) in scan_results.items():
+                        if m_scan is None:
+                            raise ValueError("Members output requested but members array is missing.")
+                        members_writers[scan_label].write_record(
+                            record_id=raw_header,
+                            strand=raw_strand,
+                            bases=seq,
+                            members=m_scan,
+                        )
 
-                    if do_reverse and avg_rev is not None:
+                if write_bg_flag:
+                    for scan_label, (_, avg_scan, _) in scan_results.items():
                         for cls_idx, cls_name in enumerate(["neither", "acceptor", "donor"]):
-                            path = f"{args.out_prefix}.{file_id}.reverse.{cls_name}.bedgraph" + (".gz" if args.gzip else "")
-                            write_bedgraph(path, chrom=chrom_bed, probs=avg_rev, class_index=cls_idx, gzip_out=args.gzip)
+                            path = f"{args.out_prefix}.{file_id}.{scan_label}.{cls_name}.bedgraph" + (".gz" if args.gzip else "")
+                            write_bedgraph(path, chrom=chrom_bed, probs=avg_scan, class_index=cls_idx, gzip_out=args.gzip)
 
                 if write_bed_flag and bed_rows is not None:
-                    _collect_bed6_bins(bed_rows, chrom_bed, avg_s, class_index=1, strand="+", feature_prefix="ACC:")
-                    _collect_bed6_bins(bed_rows, chrom_bed, avg_s, class_index=2, strand="+", feature_prefix="DON:")
-                    if do_reverse and avg_rev is not None:
-                        _collect_bed6_bins(bed_rows, chrom_bed, avg_rev, class_index=1, strand="-", feature_prefix="ACC:")
-                        _collect_bed6_bins(bed_rows, chrom_bed, avg_rev, class_index=2, strand="-", feature_prefix="DON:")
+                    for scan_label, (_, avg_scan, _) in scan_results.items():
+                        scan_tag = scan_label.upper()
+                        _collect_bed6_bins(bed_rows, chrom_bed, avg_scan, class_index=1, strand=raw_strand, feature_prefix=f"{scan_tag}:ACC:")
+                        _collect_bed6_bins(bed_rows, chrom_bed, avg_scan, class_index=2, strand=raw_strand, feature_prefix=f"{scan_tag}:DON:")
+
+    if members_writers is not None:
+        for w in members_writers.values():
+            w.close()
 
     logger.info("Finished inference for all sequences.")
 
@@ -1628,7 +1835,7 @@ def run() -> None:
         with opener(bed_out_path, "wt", encoding="utf-8", newline="\n") as fh:
             fh.write(
                 'track name="SpliceAI_bins" '
-                'description="SpliceAI acceptor/donor bins (>=0.05; excludes not_a_site, unlikely_site)" '
+                'description="SpliceAI acceptor/donor bins (>=0.05; name includes scan label; excludes not_a_site, unlikely_site)" '
                 'visibility=2 useScore=1\n'
             )
             for chrom, start, end, name, score, strand in bed_rows:
@@ -1639,7 +1846,7 @@ def run() -> None:
         with opener(bed_out_path, "wt", encoding="utf-8", newline="\n") as fh:
             fh.write(
                 'track name="SpliceAI_bins" '
-                'description="SpliceAI acceptor/donor bins (>=0.05; excludes not_a_site, unlikely_site)" '
+                'description="SpliceAI acceptor/donor bins (>=0.05; name includes scan label; excludes not_a_site, unlikely_site)" '
                 'visibility=2 useScore=1\n'
             )
 
@@ -1648,15 +1855,12 @@ def run() -> None:
         logger.info("Writing bigWig tracks in raw record order")
         for raw_idx, g_idx in enumerate(raw_to_group):
             rec = bw_group_data[g_idx]
-            if rec is None:
+            if not rec:
                 continue
-            avg_s, avg_rev = rec
             chrom_bed = raw_bed_chroms[raw_idx]
-            bw_writers.add_dense_track(bw_writers.get("sense", "acceptor"), chrom_bed, avg_s[:, 1])
-            bw_writers.add_dense_track(bw_writers.get("sense", "donor"),    chrom_bed, avg_s[:, 2])
-            if do_reverse and avg_rev is not None:
-                bw_writers.add_dense_track(bw_writers.get("reverse", "acceptor"), chrom_bed, avg_rev[:, 1])
-                bw_writers.add_dense_track(bw_writers.get("reverse", "donor"),    chrom_bed, avg_rev[:, 2])
+            for scan_label, avg in rec.items():
+                bw_writers.add_dense_track(bw_writers.get(scan_label, "acceptor"), chrom_bed, avg[:, 1])
+                bw_writers.add_dense_track(bw_writers.get(scan_label, "donor"),    chrom_bed, avg[:, 2])
         bw_writers.close()
 
     logger.info("All done!")
